@@ -1,0 +1,132 @@
+name: Android CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: walavi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test, lint, build APKs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Set up Android SDK
+        run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_HOME:-}" ]; then
+            export ANDROID_HOME=/usr/local/lib/android/sdk
+            echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          fi
+          if [ -z "${ANDROID_SDK_ROOT:-}" ]; then
+            export ANDROID_SDK_ROOT="$ANDROID_HOME"
+            echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          fi
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -maxdepth 4 -name sdkmanager -type f | head -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under $ANDROID_HOME/cmdline-tools" >&2
+            exit 1
+          fi
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          ls "$ANDROID_HOME"
+
+      - name: Install SDK packages
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(command -v sdkmanager)"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
+
+      - name: Decode release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.WALAVI_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.WALAVI_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.WALAVI_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.WALAVI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/walavi.jks"
+            echo "WALAVI_KEYSTORE=$RUNNER_TEMP/walavi.jks" >> "$GITHUB_ENV"
+            echo "WALAVI_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "WALAVI_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "WALAVI_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "Release signing enabled."
+          else
+            echo "No keystore secret; release will fall back to the debug key."
+          fi
+
+      - name: Build and test
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug assembleRelease
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp app/build/outputs/apk/debug/app-debug.apk artifacts/Walavi-debug.apk
+          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk artifacts/Walavi-release.apk
+          elif [ -f app/build/outputs/apk/release/app-release-unsigned.apk ]; then
+            cp app/build/outputs/apk/release/app-release-unsigned.apk artifacts/Walavi-release-unsigned.apk
+          else
+            echo "No release APK produced" >&2
+            exit 1
+          fi
+          ( cd artifacts && sha256sum ./*.apk > SHA256SUMS.txt )
+          ls -l artifacts
+          du -h artifacts/*.apk
+
+      - name: Verify APKs
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          echo "===== aapt2 badging (release) ====="
+          "$BT/aapt2" dump badging artifacts/Walavi-release.apk | head -14
+          echo "===== apksigner verify (release) ====="
+          "$BT/apksigner" verify --verbose --print-certs artifacts/Walavi-release.apk
+          echo "===== apksigner verify (debug) ====="
+          "$BT/apksigner" verify --verbose --print-certs artifacts/Walavi-debug.apk
+
+      - name: Publish APKs to GitHub Release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'ci-latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && format('Walavi {0}', github.ref_name) || 'Walavi - latest CI build' }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
+          generate_release_notes: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          body: |
+            Walavi pools multiple CodeBuddy accounts behind one OpenAI-compatible endpoint.
+
+            - `Walavi-release.apk` - signed release build (R8 + resource shrinking)
+            - `Walavi-debug.apk` - debug build (`com.flux.walavi.debug`)
+            - `SHA256SUMS.txt` - checksums
+
+            Install the release APK, add accounts, then point any agent at
+            `http://<device-ip>:8787/v1` with the API key shown in Settings.
+          files: |
+            artifacts/*.apk
+            artifacts/SHA256SUMS.txt
